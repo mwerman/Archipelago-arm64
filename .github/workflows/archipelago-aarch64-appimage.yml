@@ -1,0 +1,401 @@
+# Builds a NATIVE aarch64 AppImage of Archipelago (default: 0.6.7) for Arm Linux, e.g. Steam Frame (SteamOS / Holo Core).
+#
+# How it works
+#   * Runs on GitHub's native Arm runners (no QEMU): Python wheels, cx_Freeze and appimagetool are all aarch64.
+#   * Uses upstream's own packaging (`setup.py build_exe` + `bdist_appimage`) so the AppImage matches the official x86_64 one.
+#   * Builds on Ubuntu 22.04 (glibc 2.35) so it runs on anything newer, which covers rolling Arch-based SteamOS.
+#   * Then a SEPARATE job on Ubuntu 24.04 Arm boots the result: static ELF/glibc checks, frozen Generate + Server,
+#     and the Kivy launcher under Xvfb. Optionally repeats that inside a Holo Core (Arch aarch64) container.
+#   * Ships verify-appimage.sh next to the AppImage so you can run the same checks on the Frame itself.
+#
+# Needs a PUBLIC repo (free Arm runners) or a plan that includes Arm runners.
+name: Archipelago aarch64 AppImage
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Archipelago tag/branch/commit to build
+        default: "0.6.7"
+        required: true
+      python_version:
+        description: Python for the build (Archipelago supports >=3.11.9 and <3.14)
+        default: "3.12"
+        required: true
+      publish_release:
+        description: Publish a GitHub Release in THIS repo when every check passes
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # appimagetool ships an aarch64 build. "continuous" floats; pin a released tag here once you have one that works.
+  APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage
+  ARCHIPELAGO_REPO: ArchipelagoMW/Archipelago
+
+jobs:
+  # ------------------------------------------------------------------------------------------------ build
+  build:
+    name: Build (Ubuntu 22.04 Arm)
+    runs-on: ubuntu-22.04-arm
+    outputs:
+      appimage_name: ${{ steps.name.outputs.appimage_name }}
+    steps:
+      - name: Check out Archipelago
+        uses: actions/checkout@v4          # pin to a commit SHA if you want supply-chain hardening
+        with:
+          repository: ${{ env.ARCHIPELAGO_REPO }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up Python (native aarch64)
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config git wget xz-utils squashfs-tools desktop-file-utils file binutils \
+            libglib2.0-dev libgirepository1.0-dev libcairo2-dev libffi-dev libssl-dev
+          uname -m   # must print aarch64
+          python -c "import platform; print(platform.machine(), platform.python_version())"
+
+      - name: Fetch appimagetool (aarch64)
+        run: |
+          wget -nv -O appimagetool-aarch64.AppImage "$APPIMAGETOOL_URL"
+          chmod +x appimagetool-aarch64.AppImage
+          sha256sum appimagetool-aarch64.AppImage
+          file appimagetool-aarch64.AppImage | grep -q 'ARM aarch64'
+          # Runners have no FUSE: unpack it and give setup.py the `./appimagetool` it expects.
+          ./appimagetool-aarch64.AppImage --appimage-extract >/dev/null
+          printf '#!/bin/sh\nexec "%s/squashfs-root/AppRun" "$@"\n' "$PWD" > appimagetool
+          chmod +x appimagetool
+          ARCH=aarch64 ./appimagetool --version || true
+
+      - name: Look for x86_64 assumptions in setup.py
+        run: |
+          echo "--- x86 / arch mentions in setup.py (informational) ---"
+          grep -nE 'x86_64|x86-64|amd64|machine\(\)|ARCH=' setup.py || echo "(none)"
+          # If upstream hard-codes the AppImage arch, force it. No-op when the pattern is absent.
+          if grep -qE 'ARCH=x86_64' setup.py; then
+            sed -i -E 's/(ARCH=)x86_64/\1aarch64/g' setup.py
+            echo "patched ARCH=x86_64 -> aarch64"
+          fi
+
+      - name: Build (upstream build_exe + bdist_appimage)
+        env:
+          ARCH: aarch64
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          python setup.py build_exe --yes bdist_appimage --yes
+          echo "--- build/ ---"; ls -la build
+          echo "--- dist/ ---";  ls -la dist
+
+      - name: Name and checksum the AppImage
+        id: name
+        run: |
+          set -euo pipefail
+          src="$(ls dist/*.AppImage | head -n1)"
+          name="Archipelago_${{ inputs.ref }}_linux-aarch64.AppImage"
+          mkdir -p out
+          mv "$src" "out/$name"
+          # Hard stop if we accidentally produced an x86_64 runtime.
+          file "out/$name" | tee /dev/stderr | grep -q 'ARM aarch64'
+          (cd out && sha256sum "$name" > "$name.sha256")
+          echo "appimage_name=$name" >> "$GITHUB_OUTPUT"
+
+      - name: Write verify-appimage.sh
+        run: |
+          cat > out/verify-appimage.sh <<'VERIFY_EOF'
+          #!/usr/bin/env bash
+          # Verifies an Archipelago AppImage on the machine it runs on (CI runner or the Steam Frame itself).
+          #
+          #   verify-appimage.sh Archipelago_0.6.7_linux-aarch64.AppImage   full check (extracts, then boots things)
+          #   verify-appimage.sh --dir squashfs-root                        static checks only
+          #
+          # Env: EXPECT_ARCH=aarch64  GUI_SMOKE=auto|yes|no  GUI_SECONDS=25  GEN_GAME=APQuest
+          set -uo pipefail
+
+          EXPECT_ARCH="${EXPECT_ARCH:-aarch64}"
+          GUI_SMOKE="${GUI_SMOKE:-auto}"
+          GUI_SECONDS="${GUI_SECONDS:-25}"
+          GEN_GAME="${GEN_GAME:-APQuest}"
+
+          case "$EXPECT_ARCH" in
+            aarch64) MACHINE_HEX="b7 00" ;;   # ELF e_machine 0x00B7 (little endian)
+            x86_64)  MACHINE_HEX="3e 00" ;;   # only used to self-test this script on x86
+            *) echo "unsupported EXPECT_ARCH=$EXPECT_ARCH"; exit 2 ;;
+          esac
+
+          FAILS=0
+          pass() { echo "PASS  $*"; }
+          fail() { echo "FAIL  $*"; FAILS=$((FAILS + 1)); }
+          warn() { echo "WARN  $*"; }
+          info() { echo "----  $*"; }
+
+          is_elf()      { [ "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" = "7f454c46" ]; }
+          elf_machine() { od -An -tx1 -j18 -N2 "$1" 2>/dev/null | tr -s ' \n' ' ' | sed 's/^ //; s/ $//'; }
+          ver_ge()      { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }   # $1 >= $2
+
+          APPIMAGE="" ROOT=""
+          if [ "${1:-}" = "--dir" ]; then
+            ROOT="$(readlink -f "${2:?usage: $0 --dir <AppDir>}")"
+          else
+            APPIMAGE="$(readlink -f "${1:?usage: $0 <file.AppImage> | --dir <AppDir>}")"
+          fi
+
+          WORK="$(mktemp -d)"
+          SRV_PID=""
+          cleanup() { [ -n "$SRV_PID" ] && kill -KILL "$SRV_PID" 2>/dev/null; exec 3>&- 2>/dev/null; rm -rf "$WORK"; }
+          trap cleanup EXIT
+          mkdir -p "$WORK/home"
+
+          info "host: $(uname -srm)   glibc: $(getconf GNU_LIBC_VERSION 2>/dev/null || echo unknown)"
+          if [ "$(uname -m)" = "$EXPECT_ARCH" ]; then
+            pass "host CPU is $EXPECT_ARCH (native, not emulated by this script)"
+          else
+            fail "host CPU is $(uname -m), not $EXPECT_ARCH - a boot test here proves nothing"
+          fi
+
+          # ---------------------------------------------------------------- extract
+          if [ -n "$APPIMAGE" ]; then
+            chmod +x "$APPIMAGE" 2>/dev/null || true
+            if [ "$(elf_machine "$APPIMAGE")" = "$MACHINE_HEX" ]; then
+              pass "AppImage runtime is a $EXPECT_ARCH ELF"
+            else
+              fail "AppImage runtime is not a $EXPECT_ARCH ELF (machine bytes: '$(elf_machine "$APPIMAGE")')"
+            fi
+            if ( cd "$WORK" && "$APPIMAGE" --appimage-extract >/dev/null 2>"$WORK/extract.log" ); then
+              ROOT="$WORK/squashfs-root"
+              pass "AppImage extracts without FUSE"
+            else
+              fail "AppImage failed to extract:"; tail -5 "$WORK/extract.log"
+            fi
+          fi
+          [ -d "$ROOT" ] || { echo "nothing to inspect"; exit 1; }
+
+          # ---------------------------------------------------------------- every ELF must be the right arch
+          ELFS=()
+          wrong=0
+          while IFS= read -r -d '' f; do
+            is_elf "$f" || continue
+            ELFS+=("$f")
+            if [ "$(elf_machine "$f")" != "$MACHINE_HEX" ]; then
+              wrong=$((wrong + 1)); [ "$wrong" -le 10 ] && echo "      wrong arch: ${f#"$ROOT"/}"
+            fi
+          done < <(find "$ROOT" -type f \( -name '*.so' -o -name '*.so.*' -o -perm /111 \) -print0)
+          info "${#ELFS[@]} ELF files in the bundle"
+          [ "${#ELFS[@]}" -gt 0 ] || fail "no ELF files found - is this the right AppImage?"
+          [ "$wrong" -eq 0 ] && pass "every bundled ELF is $EXPECT_ARCH" || fail "$wrong bundled ELF file(s) are not $EXPECT_ARCH"
+
+          # ---------------------------------------------------------------- shared libraries resolve
+          if command -v ldd >/dev/null; then
+            LDP="$(find "$ROOT" \( -type f -o -type l \) -name '*.so*' -printf '%h\n' | sort -u | paste -sd:)"
+            missing="$(for f in "${ELFS[@]}"; do
+                         LD_LIBRARY_PATH="$LDP${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ldd "$f" 2>/dev/null | awk '/not found/ {print $1}'
+                       done | sort -u)"
+            if [ -z "$missing" ]; then pass "all shared libraries resolve (bundle + this system)"
+            else fail "unresolved shared libraries on this system:"; echo "$missing" | sed 's/^/      /'; fi
+          else
+            warn "ldd not installed - skipped shared library check"
+          fi
+
+          # ---------------------------------------------------------------- glibc / libstdc++ floor
+          host_glibc="$(getconf GNU_LIBC_VERSION 2>/dev/null | awk '{print $2}')"
+          need_glibc="$(for f in "${ELFS[@]}"; do grep -aoh 'GLIBC_[0-9][0-9.]*' "$f"; done | sed 's/GLIBC_//' | sort -uV | tail -1)"
+          if [ -n "$host_glibc" ] && [ -n "$need_glibc" ]; then
+            if ver_ge "$host_glibc" "$need_glibc"; then pass "bundle needs glibc >= $need_glibc, host has $host_glibc"
+            else fail "bundle needs glibc >= $need_glibc but host only has $host_glibc"; fi
+          else
+            warn "could not determine glibc requirement (need='${need_glibc:-?}' host='${host_glibc:-?}')"
+          fi
+          host_cxx_lib="$(ldconfig -p 2>/dev/null | awk '/libstdc\+\+\.so\.6 / {print $NF; exit}')"
+          if [ -n "$host_cxx_lib" ]; then
+            host_cxx="$(grep -aoh 'GLIBCXX_[0-9][0-9.]*' "$host_cxx_lib" | sed 's/GLIBCXX_//' | sort -uV | tail -1)"
+            need_cxx="$(for f in "${ELFS[@]}"; do grep -aoh 'GLIBCXX_[0-9][0-9.]*' "$f"; done | sed 's/GLIBCXX_//' | sort -uV | tail -1)"
+            if [ -n "$need_cxx" ] && ! ver_ge "$host_cxx" "$need_cxx"; then
+              warn "bundle references GLIBCXX_$need_cxx, system libstdc++ only has $host_cxx (fine if the bundle ships its own libstdc++)"
+            fi
+          fi
+
+          # ---------------------------------------------------------------- boot tests (frozen binaries)
+          LAUNCHER="$(find "$ROOT" -type f -name 'ArchipelagoLauncher' -perm /111 | head -1)"
+          if [ -z "$LAUNCHER" ]; then
+            fail "ArchipelagoLauncher not found inside the AppImage"
+          else
+            EXE_DIR="$(dirname "$LAUNCHER")"
+            export HOME="$WORK/home" XDG_DATA_HOME="$WORK/home/.local/share" XDG_CONFIG_HOME="$WORK/home/.config" XDG_CACHE_HOME="$WORK/home/.cache"
+            export SDL_AUDIODRIVER=dummy KIVY_NO_ARGS=1
+
+            GEN="$EXE_DIR/ArchipelagoGenerate"
+            SRV="$EXE_DIR/ArchipelagoServer"
+
+            if [ -x "$GEN" ]; then
+              out="$(timeout 180 "$GEN" --help 2>&1)"; rc=$?
+              if [ $rc -eq 0 ] && echo "$out" | grep -qi 'usage'; then pass "ArchipelagoGenerate --help runs (frozen interpreter + world imports OK)"
+              else fail "ArchipelagoGenerate --help failed (exit $rc)"; echo "$out" | tail -15 | sed 's/^/      /'; fi
+
+              mkdir -p "$WORK/players" "$WORK/output"
+              printf 'name: SmokeTest\ngame: %s\n%s: {}\n' "$GEN_GAME" "$GEN_GAME" > "$WORK/players/smoke.yaml"
+              out="$(timeout 300 "$GEN" --player_files_path "$WORK/players" --outputpath "$WORK/output" --seed 1 2>&1)"; rc=$?
+              ZIP="$(ls "$WORK"/output/AP_*.zip 2>/dev/null | head -1)"
+              if [ $rc -eq 0 ] && [ -n "$ZIP" ]; then pass "generated a multiworld with '$GEN_GAME' ($(basename "$ZIP"))"
+              else fail "test generation with '$GEN_GAME' failed (exit $rc)"; echo "$out" | tail -20 | sed 's/^/      /'; fi
+            else
+              fail "ArchipelagoGenerate not found next to the launcher"
+            fi
+
+            if [ -x "$SRV" ] && [ -n "${ZIP:-}" ]; then
+              PORT=38281
+              mkfifo "$WORK/srv.in"; exec 3<>"$WORK/srv.in"     # keep stdin open so the server doesn't quit on EOF
+              "$SRV" "$ZIP" --host 127.0.0.1 --port "$PORT" <&3 >"$WORK/server.log" 2>&1 &
+              SRV_PID=$!
+              up=0
+              for _ in $(seq 60); do
+                (exec 4<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null && { up=1; break; }
+                kill -0 "$SRV_PID" 2>/dev/null || break
+                sleep 1
+              done
+              if [ $up -eq 1 ]; then
+                pass "ArchipelagoServer hosts the generated game on port $PORT"
+                kill -INT "$SRV_PID" 2>/dev/null
+                for _ in $(seq 15); do kill -0 "$SRV_PID" 2>/dev/null || break; sleep 1; done
+                kill -0 "$SRV_PID" 2>/dev/null && { warn "server ignored SIGINT for 15s, killing"; kill -KILL "$SRV_PID"; }
+              else
+                fail "ArchipelagoServer never opened port $PORT"; tail -15 "$WORK/server.log" | sed 's/^/      /'
+              fi
+              wait "$SRV_PID" 2>/dev/null; SRV_PID=""
+            else
+              warn "skipped server test (server binary or generated game missing)"
+            fi
+
+            # ------------------------------------------------------------- boot test (GUI launcher)
+            runner=()
+            want_gui=0
+            if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+              [ "$GUI_SMOKE" != "no" ] && want_gui=1
+            elif command -v xvfb-run >/dev/null; then
+              [ "$GUI_SMOKE" != "no" ] && want_gui=1
+              runner=(xvfb-run -a -s "-screen 0 1280x800x24 +extension GLX +render -noreset")
+              export LIBGL_ALWAYS_SOFTWARE=1
+            elif [ "$GUI_SMOKE" = "yes" ]; then
+              fail "GUI_SMOKE=yes but there is no display and no xvfb-run"
+            else
+              warn "no display and no xvfb-run - skipped GUI boot test"
+            fi
+
+            if [ $want_gui -eq 1 ]; then
+              target="${APPIMAGE:-$LAUNCHER}"      # prefer the real AppImage: exercises runtime + AppRun too
+              info "launching $(basename "$target") for ${GUI_SECONDS}s (${runner[0]:-your real display})"
+              APPIMAGE_EXTRACT_AND_RUN=1 "${runner[@]}" timeout -s TERM "$GUI_SECONDS" "$target" >"$WORK/gui.log" 2>&1
+              rc=$?
+              if grep -qE 'Illegal instruction|Segmentation fault|error while loading shared libraries|cannot open shared object' "$WORK/gui.log"; then
+                fail "launcher crashed while starting:"; grep -E 'Illegal instruction|Segmentation|shared lib|shared object' "$WORK/gui.log" | head -5 | sed 's/^/      /'
+              elif [ $rc -eq 124 ]; then
+                pass "GUI launcher was still running after ${GUI_SECONDS}s (booted)"
+              else
+                fail "GUI launcher exited early with code $rc"; tail -25 "$WORK/gui.log" | sed 's/^/      /'
+              fi
+              grep -q 'Traceback' "$WORK/gui.log" && { warn "Python traceback(s) in launcher output:"; grep -B2 -A8 'Traceback' "$WORK/gui.log" | head -30 | sed 's/^/      /'; }
+            fi
+          fi
+
+          echo
+          if [ "$FAILS" -eq 0 ]; then echo "RESULT: all checks passed"; else echo "RESULT: $FAILS check(s) failed"; fi
+          [ "$FAILS" -eq 0 ]
+          VERIFY_EOF
+          chmod +x out/verify-appimage.sh
+
+      - name: Upload AppImage + verifier
+        uses: actions/upload-artifact@v4
+        with:
+          name: archipelago-aarch64
+          path: out/*
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------------------------------------ boot test
+  boot-test:
+    name: Boot test (Ubuntu 24.04 Arm, native)
+    needs: build
+    runs-on: ubuntu-24.04-arm      # deliberately NEWER than the build host, like the Frame's rolling OS
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: archipelago-aarch64
+          path: out
+
+      - name: Install headless GUI stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xauth mesa-utils libgl1-mesa-dri libglx-mesa0 libegl1 libgles2 file
+
+      - name: Verify checksum
+        run: cd out && sha256sum -c ./*.sha256
+
+      - name: Run verify-appimage.sh (native aarch64)
+        run: |
+          chmod +x out/verify-appimage.sh out/*.AppImage
+          out/verify-appimage.sh "out/${{ needs.build.outputs.appimage_name }}" 2>&1 | tee boot-test.log
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-test-log
+          path: boot-test.log
+
+  # ------------------------------------------------------------------------------------------------ optional: Holo Core
+  # Set a repository variable HOLO_CORE_IMAGE (Settings -> Secrets and variables -> Actions -> Variables) to the
+  # aarch64 Holo Core / SteamOS container image from Valve+Collabora's announcement to also test on that userspace.
+  # Informational: never blocks the release job.
+  boot-test-holo-core:
+    name: Boot test (Holo Core container, optional)
+    needs: build
+    if: ${{ vars.HOLO_CORE_IMAGE != '' }}
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    container:
+      image: ${{ vars.HOLO_CORE_IMAGE }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: archipelago-aarch64
+          path: out
+
+      - name: Install test dependencies (Arch package names)
+        run: pacman -Sy --noconfirm --needed xorg-server-xvfb xorg-xauth mesa binutils grep coreutils findutils
+
+      - name: Run verify-appimage.sh
+        run: |
+          chmod +x out/verify-appimage.sh out/*.AppImage
+          out/verify-appimage.sh "out/${{ needs.build.outputs.appimage_name }}"
+
+  # ------------------------------------------------------------------------------------------------ release
+  release:
+    name: Publish release
+    needs: [build, boot-test]
+    if: ${{ inputs.publish_release }}
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: archipelago-aarch64
+          path: out
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.ref }}-aarch64
+        run: |
+          gh release create "$TAG" out/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Archipelago ${{ inputs.ref }} (aarch64 AppImage)" \
+            --notes "Unofficial native aarch64 AppImage of Archipelago ${{ inputs.ref }}, built from upstream with its own packaging. \
+          Run \`verify-appimage.sh\` on your device to self-check. \
+          Boot-tested natively on Ubuntu 24.04 Arm in CI; see the workflow run for details."
