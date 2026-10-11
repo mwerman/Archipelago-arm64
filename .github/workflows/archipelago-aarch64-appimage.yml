@@ -1,4 +1,4 @@
-# Builds a NATIVE aarch64 AppImage of Archipelago (default: 0.6.7) for Arm Linux, e.g. Steam Frame (SteamOS / Holo Core).
+# Builds a NATIVE aarch64 AppImage of Archipelago (default: 0.6.8) for Arm Linux, e.g. Steam Frame (SteamOS / Holo Core).
 #
 # How it works
 #   * Runs on GitHub's native Arm runners (no QEMU): Python wheels, cx_Freeze and appimagetool are all aarch64.
@@ -16,7 +16,7 @@ on:
     inputs:
       ref:
         description: Archipelago tag/branch/commit to build
-        default: "0.6.7"
+        default: "0.6.8"
         required: true
       python_version:
         description: Python for the build (Archipelago supports >=3.11.9 and <3.14)
@@ -114,7 +114,7 @@ jobs:
           #!/usr/bin/env bash
           # Verifies an Archipelago AppImage on the machine it runs on (CI runner or the Steam Frame itself).
           #
-          #   verify-appimage.sh Archipelago_0.6.7_linux-aarch64.AppImage   full check (extracts, then boots things)
+          #   verify-appimage.sh Archipelago_0.6.8_linux-aarch64.AppImage   full check (extracts, then boots things)
           #   verify-appimage.sh --dir squashfs-root                        static checks only
           #
           # Env: EXPECT_ARCH=aarch64  GUI_SMOKE=auto|yes|no  GUI_SECONDS=25  GEN_GAME=APQuest
